@@ -1,0 +1,20 @@
+# Entorno
+.env
+.env.local
+.venv/
+venv/
+
+# uv
+.uv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
