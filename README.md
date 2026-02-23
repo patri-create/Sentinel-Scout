@@ -1,5 +1,9 @@
 # Sentinel & Scout ML
 
+<p align="center">
+  <img src="assets/logo.png" alt="Logo" width="200" />
+</p>
+
 Real-time fraud detection API. Machine Learning Engineering project oriented to production.
 
 ---
