@@ -7,6 +7,7 @@ services:
       - redis
     environment:
       - REDIS_HOST=redis
+      - GROQ_API_KEY=${GROQ_API_KEY}
 
   redis:
     image: redis:alpine
