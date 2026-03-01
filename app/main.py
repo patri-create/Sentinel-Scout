@@ -22,6 +22,12 @@ import xgboost as xgb
 import numpy as np
 from contextlib import asynccontextmanager
 
+import time
+
+from app.tracker_manager import tracker, TrackEvent
+from app.metrics_logger import MetricsLogger
+
+start_time = time.time()
 model = xgb.Booster()
 
 logging.basicConfig(level=logging.INFO)
@@ -64,10 +70,14 @@ async def predict(transaction: Transaction):
     dmatrix = xgb.DMatrix(features)
     prediction_prob = model.predict(dmatrix)[0]
 
-    # DEBUG LOG
-    print(f"DEBUG: Amount={transaction.amount}, Count={current_count}, Prob={prediction_prob}")
+    tracker.increment(TrackEvent.PREDICTION)
     
     is_fraud = prediction_prob > 0.5 or current_count > 3
+
+    if is_fraud:
+        tracker.increment(TrackEvent.FRAUD_DETECTED)
+
+    MetricsLogger.log_audit(transaction.user_id, prediction_prob, current_count, is_fraud)
 
     return {
         "is_fraud": bool(is_fraud),
@@ -95,10 +105,12 @@ async def investigate(transaction: Transaction, background_tasks: BackgroundTask
 
     features = np.array([[transaction.amount, transaction.timestamp.hour, 1.0, float(current_count)]])
     prediction_prob = float(model.predict(xgb.DMatrix(features))[0])
+    tracker.increment(TrackEvent.PREDICTION)
 
     is_fraud = prediction_prob > 0.5 or current_count > 3
 
     if is_fraud:
+        tracker.increment(TrackEvent.FRAUD_DETECTED)
         background_tasks.add_task(
             run_scout_investigation, 
             transaction.model_dump(mode="json"), 
@@ -106,6 +118,8 @@ async def investigate(transaction: Transaction, background_tasks: BackgroundTask
             current_count
         )
 
+    MetricsLogger.log_audit(transaction.user_id, prediction_prob, current_count, is_fraud)
+    
     return {
         "is_fraud": is_fraud,
         "probability": prediction_prob,
@@ -114,8 +128,25 @@ async def investigate(transaction: Transaction, background_tasks: BackgroundTask
     }
 
 @app.get("/health")
-def health_check():
-    return {"status": "healthy", "timestamp": "2026-02-16T...Z"}
+async def health_check():
+    try:
+        redis_ready = redis_client.ping()
+    except:
+        redis_ready = False
+    
+    model_ready = model is not None
+
+    tracker_stats = tracker.get_stats()
+
+    return {
+        "status": "healthy" if redis_ready and model_ready else "unhealthy",
+        "uptime_seconds": int(time.time() - start_time),
+        "checks": {
+            "redis:": "up" if redis_ready else "down",
+            "model_sentinel": "loaded" if model_ready else "missing"    
+        },
+        "performance": tracker_stats
+    }
 
 
 @app.exception_handler(Exception)
