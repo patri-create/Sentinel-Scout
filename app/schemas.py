@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 
 class Transaction(BaseModel):
-    transaction_id: str
     user_id: str
     amount: float = Field(gt=0, description="The amount must be greater than zero")
     timestamp: datetime
@@ -17,3 +16,8 @@ class Transaction(BaseModel):
         if v not in allowed:
             raise ValueError(f"Invalid category. Use: {allowed}")
         return v
+
+class Feedback(BaseModel):
+    transaction_id: str
+    is_fraud_actual: bool
+    analyst_id: str
