@@ -1,8 +1,11 @@
-# Entorno
+# Environment
 .env
 .env.local
 .venv/
 venv/
+retraining_data.csv
+model_sentinel.json
+model_sentinel_new.json
 
 # uv
 .uv/

@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
+import csv
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -13,10 +14,14 @@ from fastapi import BackgroundTasks
 from app import __version__
 from app.schemas import Transaction
 from app.scout import get_fraud_explanation
+from app.schemas import Feedback
+from app.model_manager import ModelManagerSingleton
 
 import json
 import os
 import redis
+from pathlib import Path
+from datetime import datetime
 
 import xgboost as xgb
 import numpy as np
@@ -26,6 +31,8 @@ import time
 
 from app.tracker_manager import tracker, TrackEvent
 from app.metrics_logger import MetricsLogger
+
+import uuid
 
 start_time = time.time()
 model = xgb.Booster()
@@ -41,12 +48,19 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
+def _model_path() -> Path:
+    return Path(__file__).resolve().parent / "model_sentinel.json"
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model
+    path = _model_path()
     try:
-        model.load_model("app/model_sentinel.json")
-        print("🧠 Sentinel Brain Loaded and Ready")
+        if path.exists():
+            model.load_model(str(path))
+            print("🧠 Sentinel Brain Loaded and Ready")
+        else:
+            print(f"⚠️ Model not found at {path}; /predict and /investigate will fail until the file exists.")
     except Exception as e:
         print(f"❌ Critical Failure: Could not load model: {e}")
     yield
@@ -56,6 +70,7 @@ app = FastAPI(title="Sentinel & Scout API", lifespan=lifespan)
 
 @app.post("/predict")
 async def predict(transaction: Transaction):
+    tx_id = str(uuid.uuid4())
     user_key = f"tx_count:{transaction.user_id}"
     current_count = redis_client.incr(user_key)
     if current_count == 1: redis_client.expire(user_key, 60)
@@ -67,8 +82,11 @@ async def predict(transaction: Transaction):
         float(current_count)
     ]])
 
-    dmatrix = xgb.DMatrix(features)
-    prediction_prob = model.predict(dmatrix)[0]
+    prediction_prob = float(ModelManagerSingleton.model.predict_proba(features)[0][1])
+
+    tx_data = transaction.model_dump(mode="json")
+    tx_data["tx_id"] = tx_id
+    redis_client.setex(f"tx_features:{tx_id}", 86400, json.dumps(tx_data))
 
     tracker.increment(TrackEvent.PREDICTION)
     
@@ -80,6 +98,7 @@ async def predict(transaction: Transaction):
     MetricsLogger.log_audit(transaction.user_id, prediction_prob, current_count, is_fraud)
 
     return {
+        "tx_id": tx_id,
         "is_fraud": bool(is_fraud),
         "probability": float(prediction_prob),
         "tx_per_minute": current_count,
@@ -98,13 +117,17 @@ async def run_scout_investigation(transaction_dict, prob, count):
 
 @app.post("/investigate")
 async def investigate(transaction: Transaction, background_tasks: BackgroundTasks):
+    tx_id = str(uuid.uuid4())
     user_key = f"tx_count:{transaction.user_id}"
     current_count = redis_client.incr(user_key)
     if current_count == 1:
         redis_client.expire(user_key, 60)
 
     features = np.array([[transaction.amount, transaction.timestamp.hour, 1.0, float(current_count)]])
-    prediction_prob = float(model.predict(xgb.DMatrix(features))[0])
+    prediction_prob = float(ModelManagerSingleton.model.predict_proba(features)[0][1])
+    tx_data = transaction.model_dump(mode="json")
+    tx_data["tx_id"] = tx_id
+    redis_client.setex(f"tx_features:{tx_id}", 86400, json.dumps(tx_data))
     tracker.increment(TrackEvent.PREDICTION)
 
     is_fraud = prediction_prob > 0.5 or current_count > 3
@@ -121,6 +144,7 @@ async def investigate(transaction: Transaction, background_tasks: BackgroundTask
     MetricsLogger.log_audit(transaction.user_id, prediction_prob, current_count, is_fraud)
     
     return {
+        "tx_id": tx_id,
         "is_fraud": is_fraud,
         "probability": prediction_prob,
         "status": "Action Taken" if is_fraud else "Clear",
@@ -148,6 +172,38 @@ async def health_check():
         "performance": tracker_stats
     }
 
+@app.post("/feedback")
+async def feedback(data: Feedback):
+    tx_key = f"tx_features:{data.transaction_id}"
+    raw_data = redis_client.get(tx_key)
+    
+    if not raw_data:
+        return {"status": "error", "message": "Transaction ID not found or expired (24h limit)"}
+
+    raw_str = raw_data if isinstance(raw_data, str) else raw_data.decode("utf-8")
+    tx_features = json.loads(raw_str)
+
+    new_row = [
+        tx_features['amount'],
+        tx_features['timestamp'],
+        data.is_fraud_actual
+    ]
+
+    csv_file = Path(__file__).resolve().parent / "retraining_data.csv"
+    file_exists = csv_file.is_file()
+
+    with open(csv_file, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["amount", "timestamp", "is_fraud_actual"])
+        writer.writerow(new_row)
+
+    redis_client.delete(tx_key)
+
+    return {
+        "status": "success", 
+        "message": f"Feedback processed for {data.transaction_id}. Data added to retraining set."
+    }
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -156,3 +212,22 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"message": "Internal server error in ML Sentinel."},
     )
+
+
+@app.post("/admin/reload-model")
+async def reload_model(filename: str = "model_sentinel_new.json"):
+    full_path = f"app/{filename}"
+    success = ModelManagerSingleton.reload(full_path)
+
+    if success:
+        return {
+            "status": "success", 
+            "message": f"Sentinel has updated its brain with {filename}",
+            "model_path": full_path
+        }
+    else:
+        return {
+            "status": "error", 
+            "message": "Error to reload the model. The previous model is still active."
+        }
+
